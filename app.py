@@ -1,10 +1,18 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pulp
 
 app = Flask(__name__)
+CORS(app)  # Allows Base44 to talk to Render without browser security blocks
 
-@app.route('/optimize', methods=['POST'])
+# Accept both 'z' and 's' spellings, and allow 'OPTIONS' test checks
+@app.route('/optimize', methods=['POST', 'OPTIONS'])
+@app.route('/optimise', methods=['POST', 'OPTIONS'])
 def optimize_team():
+    # Handle browser security preflight check
+    if request.method == 'OPTIONS':
+        return '', 200
+
     data = request.get_json()
     
     players = data.get('players', []) # List: [{id, name, position, price, xp}, ...]
