@@ -3,19 +3,17 @@ from flask_cors import CORS
 import pulp
 
 app = Flask(__name__)
-CORS(app)  # Allows Base44 to talk to Render without browser security blocks
+CORS(app)
 
-# Accept both 'z' and 's' spellings, and allow 'OPTIONS' test checks
 @app.route('/optimize', methods=['POST', 'OPTIONS'])
 @app.route('/optimise', methods=['POST', 'OPTIONS'])
 def optimize_team():
-    # Handle browser security preflight check
     if request.method == 'OPTIONS':
         return '', 200
 
     data = request.get_json() or {}
     
-    players = data.get('players', []) # List: [{id, name, position, price, xp, team}, ...]
+    players = data.get('players', [])
     budget = float(data.get('budget', 100.0))
     
     if not players:
@@ -23,11 +21,10 @@ def optimize_team():
 
     prob = pulp.LpProblem("FPL_Starting_XI_Optimizer", pulp.LpMaximize)
     
-    # Decision Variables
     x = {p['id']: pulp.LpVariable(f"x_{p['id']}", cat='Binary') for p in players}
     y = {p['id']: pulp.LpVariable(f"y_{p['id']}", cat='Binary') for p in players}
     
-    # --- HELPER FUNCTIONS FOR SAFE KEY EXTRACTION & NORMALIZATION ---
+    # SAFE VALUE EXTRACTION
     def get_xp(p):
         val = p.get('xp') if p.get('xp') is not None else p.get('xP', 0.0)
         try:
@@ -36,69 +33,69 @@ def optimize_team():
             return 0.0
 
     def get_price(p):
-        val = p.get('price') if p.get('price') is not None else p.get('cost', 0.0)
+        val = p.get('price') if p.get('price') is not None else p.get('cost', p.get('now_cost', 0.0))
         try:
-            return float(val)
+            val = float(val)
+            # Handle standard FPL prices (e.g. 100 = 10.0m or 85 = 8.5m)
+            return val / 10.0 if val > 20.0 else val
         except (ValueError, TypeError):
             return 0.0
 
     def get_pos(p):
-        pos = str(p.get('position') or p.get('pos') or '').strip().upper()
-        if pos in ['GK', 'GKP', 'GOALKEEPER']:
+        pos = p.get('position') or p.get('pos') or p.get('element_type') or ''
+        pos_str = str(pos).strip().upper()
+        
+        # Handle FPL raw integer IDs (1=GKP, 2=DEF, 3=MID, 4=FWD)
+        if pos_str in ['1', 'GK', 'GKP', 'GOALKEEPER']:
             return 'GKP'
-        elif pos in ['DEF', 'DEFENDER']:
+        elif pos_str in ['2', 'DEF', 'DEFENDER']:
             return 'DEF'
-        elif pos in ['MID', 'MIDFIELDER']:
+        elif pos_str in ['3', 'MID', 'MIDFIELDER']:
             return 'MID'
-        elif pos in ['FWD', 'FORWARD', 'ATTACKER']:
+        elif pos_str in ['4', 'FWD', 'FORWARD', 'ATTACKER']:
             return 'FWD'
-        return pos
+        return pos_str
 
     def get_team(p):
-        return p.get('team') or p.get('team_name') or p.get('club') or 'Unknown'
+        return str(p.get('team') or p.get('team_name') or p.get('club') or '').strip()
 
-    # --- OBJECTIVE FUNCTION ---
-    # Maximize total regular expected points + double points for captain
+    # OBJECTIVE
     prob += pulp.lpSum(get_xp(p) * x[p['id']] + get_xp(p) * y[p['id']] for p in players)
     
-    # --- CONSTRAINTS ---
-    
-    # 1. Total Budget
+    # CONSTRAINTS
+    # 1. Budget
     prob += pulp.lpSum(get_price(p) * x[p['id']] for p in players) <= budget
     
-    # 2. Total starting lineup size = 11 players
+    # 2. Total starting XI size = 11
     prob += pulp.lpSum(x[p['id']] for p in players) == 11
     
-    # 3. Exactly 1 Goalkeeper
+    # 3. Positional limits
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'GKP') == 1
-    
-    # 4. Valid FPL Formation Limits (Min/Max per outfield position)
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') >= 3
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') <= 5
-
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') >= 2
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') <= 5
-
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') >= 1
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') <= 3
 
-    # 5. Max 3 Players Per Club/Team
-    teams = set(get_team(p) for p in players)
+    # 4. Max 3 players per team (only enforced if team data is present)
+    teams = set(get_team(p) for p in players if get_team(p))
     for team in teams:
-        if team != 'Unknown':
-            prob += pulp.lpSum(x[p['id']] for p in players if get_team(p) == team) <= 3
+        prob += pulp.lpSum(x[p['id']] for p in players if get_team(p) == team) <= 3
 
-    # 6. Exactly 1 Captain
+    # 5. Captain constraints
     prob += pulp.lpSum(y[p['id']] for p in players) == 1
-    
-    # 7. Captain must be selected in the starting XI
     for p in players:
         prob += y[p['id']] <= x[p['id']]
         
-    # --- SOLVE ---
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    # SOLVE
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
-    # --- EXTRACT RESULTS ---
+    # Check if PuLP found a solution
+    if status != 1:  # 1 = Optimal solution found
+        return jsonify({"status": "error", "message": "Infeasible model"}), 400
+
+    # EXTRACT RESULTS
     starting_xi = [p for p in players if x[p['id']].varValue and x[p['id']].varValue > 0.5]
     captain = next((p for p in players if y[p['id']].varValue and y[p['id']].varValue > 0.5), None)
     
