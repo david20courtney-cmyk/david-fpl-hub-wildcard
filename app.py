@@ -13,47 +13,63 @@ def optimize_team():
     if request.method == 'OPTIONS':
         return '', 200
 
-    data = request.get_json()
+    data = request.get_json() or {}
     
     players = data.get('players', []) # List: [{id, name, position, price, xp}, ...]
     budget = data.get('budget', 100.0)
     
+    if not players:
+        return jsonify({"status": "error", "message": "No players provided"}), 400
+
     prob = pulp.LpProblem("FPL_Starting_XI_Optimizer", pulp.LpMaximize)
     
-    # x_i = 1 if player is in the 11-man starting lineup
+    # Decision Variables
     x = {p['id']: pulp.LpVariable(f"x_{p['id']}", cat='Binary') for p in players}
-    
-    # y_i = 1 if player is chosen as CAPTAIN (must be in the starting XI)
     y = {p['id']: pulp.LpVariable(f"y_{p['id']}", cat='Binary') for p in players}
     
+    # Helper function to get expected points safely
+    def get_xp(p):
+        val = p.get('xp') if p.get('xp') is not None else p.get('xP', 0.0)
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    # Helper function to get price safely
+    def get_price(p):
+        val = p.get('price') if p.get('price') is not None else p.get('cost', 0.0)
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+
+    # Helper function to get position safely
+    def get_pos(p):
+        return p.get('position') or p.get('pos') or ''
+
     # OBJECTIVE: Maximize total regular points plus double points for the captain
-    prob += pulp.lpSum(p['xp'] * x[p['id']] + p['xp'] * y[p['id']] for p in players)
+    prob += pulp.lpSum(get_xp(p) * x[p['id']] + get_xp(p) * y[p['id']] for p in players)
     
     # CONSTRAINT: Total Budget
-    prob += pulp.lpSum(p['price'] * x[p['id']] for p in players) <= budget
+    prob += pulp.lpSum(get_price(p) * x[p['id']] for p in players) <= budget
     
     # CONSTRAINT: Total starting lineup size = 11 players
     prob += pulp.lpSum(x[p['id']] for p in players) == 11
     
     # CONSTRAINT: Exactly 1 Goalkeeper
-    prob += pulp.lpSum(x[p['id']] for p in players if p['position'] == 'GKP') == 1
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'GKP') == 1
     
-    # CONSTRAINTS: Outfield position limits (Min 1 FWD, Max 3 FWD, Max 5 DEF, Max 5 MID)
-    # Total outfielders = 10 (since 1 is GKP, and 1 + 10 = 11 total)
-    defs = [x[p['id']] for p in players if p['position'] == 'DEF']
-    mids = [x[p['id']] for p in players if p['position'] == 'MID']
-    fwds = [p['id'] for p in players if p['position'] == 'FWD']
-    
-    prob += pulp.lpSum(x[p['id']] for p in players if p['position'] == 'DEF') <= 5
-    prob += pulp.lpSum(x[p['id']] for p in players if p['position'] == 'MID') <= 5
-    prob += pulp.lpSum(x[p['id']] for p in players if p['position'] == 'FWD') >= 1
-    prob += pulp.lpSum(x[p['id']] for p in players if p['position'] == 'FWD') <= 3
+    # CONSTRAINTS: Outfield position limits
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') <= 5
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') <= 5
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') >= 1
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') <= 3
     
     # Ensure total outfielders (DEF + MID + FWD) equals exactly 10
     prob += (
-        pulp.lpSum(x[p['id']] for p in players if p['position'] == 'DEF') +
-        pulp.lpSum(x[p['id']] for p in players if p['position'] == 'MID') +
-        pulp.lpSum(x[p['id']] for p in players if p['position'] == 'FWD')
+        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') +
+        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') +
+        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD')
     ) == 10
 
     # CONSTRAINT: Exactly ONE captain across the starting XI
@@ -67,13 +83,23 @@ def optimize_team():
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
     # Extract results
-    selected_ids = [p['id'] for p in players if x[p['id']].varValue > 0.5]
-    captain_id = next((p['id'] for p in players if y[p['id']].varValue > 0.5), None)
+    starting_xi = [p for p in players if x[p['id']].varValue and x[p['id']].varValue > 0.5]
+    captain = next((p for p in players if y[p['id']].varValue and y[p['id']].varValue > 0.5), None)
     
+    selected_ids = [p['id'] for p in starting_xi]
+    captain_id = captain['id'] if captain else None
+
+    total_cost = sum(get_price(p) for p in starting_xi)
+    total_xp = sum(get_xp(p) for p in starting_xi) + (get_xp(captain) if captain else 0.0)
+
     return jsonify({
         "status": "success",
         "selected_player_ids": selected_ids,
-        "captain_id": captain_id
+        "captain_id": captain_id,
+        "starting_xi": starting_xi,
+        "captain": captain,
+        "total_cost": round(total_cost, 1),
+        "total_xp": round(total_xp, 2)
     })
 
 if __name__ == '__main__':
