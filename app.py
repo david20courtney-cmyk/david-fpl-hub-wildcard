@@ -15,7 +15,7 @@ def optimize_team():
 
     data = request.get_json() or {}
     
-    players = data.get('players', []) # List: [{id, name, position, price, xp}, ...]
+    players = data.get('players', []) # List: [{id, name, position, price, xp, team}, ...]
     budget = float(data.get('budget', 100.0))
     
     if not players:
@@ -54,6 +54,9 @@ def optimize_team():
             return 'FWD'
         return pos
 
+    def get_team(p):
+        return p.get('team') or p.get('team_name') or p.get('club') or 'Unknown'
+
     # --- OBJECTIVE FUNCTION ---
     # Maximize total regular expected points + double points for captain
     prob += pulp.lpSum(get_xp(p) * x[p['id']] + get_xp(p) * y[p['id']] for p in players)
@@ -79,10 +82,16 @@ def optimize_team():
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') >= 1
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') <= 3
 
-    # 5. Exactly 1 Captain
+    # 5. Max 3 Players Per Club/Team
+    teams = set(get_team(p) for p in players)
+    for team in teams:
+        if team != 'Unknown':
+            prob += pulp.lpSum(x[p['id']] for p in players if get_team(p) == team) <= 3
+
+    # 6. Exactly 1 Captain
     prob += pulp.lpSum(y[p['id']] for p in players) == 1
     
-    # 6. Captain must be selected in the starting XI
+    # 7. Captain must be selected in the starting XI
     for p in players:
         prob += y[p['id']] <= x[p['id']]
         
