@@ -16,7 +16,7 @@ def optimize_team():
     data = request.get_json() or {}
     
     players = data.get('players', []) # List: [{id, name, position, price, xp}, ...]
-    budget = data.get('budget', 100.0)
+    budget = float(data.get('budget', 100.0))
     
     if not players:
         return jsonify({"status": "error", "message": "No players provided"}), 400
@@ -27,7 +27,7 @@ def optimize_team():
     x = {p['id']: pulp.LpVariable(f"x_{p['id']}", cat='Binary') for p in players}
     y = {p['id']: pulp.LpVariable(f"y_{p['id']}", cat='Binary') for p in players}
     
-    # Helper function to get expected points safely
+    # --- HELPER FUNCTIONS FOR SAFE KEY EXTRACTION & NORMALIZATION ---
     def get_xp(p):
         val = p.get('xp') if p.get('xp') is not None else p.get('xP', 0.0)
         try:
@@ -35,7 +35,6 @@ def optimize_team():
         except (ValueError, TypeError):
             return 0.0
 
-    # Helper function to get price safely
     def get_price(p):
         val = p.get('price') if p.get('price') is not None else p.get('cost', 0.0)
         try:
@@ -43,46 +42,54 @@ def optimize_team():
         except (ValueError, TypeError):
             return 0.0
 
-    # Helper function to get position safely
     def get_pos(p):
-        return p.get('position') or p.get('pos') or ''
+        pos = str(p.get('position') or p.get('pos') or '').strip().upper()
+        if pos in ['GK', 'GKP', 'GOALKEEPER']:
+            return 'GKP'
+        elif pos in ['DEF', 'DEFENDER']:
+            return 'DEF'
+        elif pos in ['MID', 'MIDFIELDER']:
+            return 'MID'
+        elif pos in ['FWD', 'FORWARD', 'ATTACKER']:
+            return 'FWD'
+        return pos
 
-    # OBJECTIVE: Maximize total regular points plus double points for the captain
+    # --- OBJECTIVE FUNCTION ---
+    # Maximize total regular expected points + double points for captain
     prob += pulp.lpSum(get_xp(p) * x[p['id']] + get_xp(p) * y[p['id']] for p in players)
     
-    # CONSTRAINT: Total Budget
+    # --- CONSTRAINTS ---
+    
+    # 1. Total Budget
     prob += pulp.lpSum(get_price(p) * x[p['id']] for p in players) <= budget
     
-    # CONSTRAINT: Total starting lineup size = 11 players
+    # 2. Total starting lineup size = 11 players
     prob += pulp.lpSum(x[p['id']] for p in players) == 11
     
-    # CONSTRAINT: Exactly 1 Goalkeeper
+    # 3. Exactly 1 Goalkeeper
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'GKP') == 1
     
-    # CONSTRAINTS: Outfield position limits
+    # 4. Valid FPL Formation Limits (Min/Max per outfield position)
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') >= 3
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') <= 5
+
+    prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') >= 2
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') <= 5
+
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') >= 1
     prob += pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD') <= 3
-    
-    # Ensure total outfielders (DEF + MID + FWD) equals exactly 10
-    prob += (
-        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'DEF') +
-        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'MID') +
-        pulp.lpSum(x[p['id']] for p in players if get_pos(p) == 'FWD')
-    ) == 10
 
-    # CONSTRAINT: Exactly ONE captain across the starting XI
+    # 5. Exactly 1 Captain
     prob += pulp.lpSum(y[p['id']] for p in players) == 1
     
-    # CONSTRAINT: A player can only be captain if they are in the starting XI
+    # 6. Captain must be selected in the starting XI
     for p in players:
         prob += y[p['id']] <= x[p['id']]
         
-    # Solve
+    # --- SOLVE ---
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
-    # Extract results
+    # --- EXTRACT RESULTS ---
     starting_xi = [p for p in players if x[p['id']].varValue and x[p['id']].varValue > 0.5]
     captain = next((p for p in players if y[p['id']].varValue and y[p['id']].varValue > 0.5), None)
     
